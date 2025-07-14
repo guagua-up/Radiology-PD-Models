@@ -1,0 +1,313 @@
+# 清除环境变量
+rm(list = ls())
+
+# 安装并加载所需包
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(e1071, caret, pROC, randomForest, ggplot2, ROCR, ggpubr, dplyr, tidyr, purrr)
+
+# 定义函数执行置换检验
+permutation_test <- function(model, test_data, n_permutations = 1000) {
+  observed_accuracy <- confusionMatrix(predict(model, test_data), test_data$Diagnosis)$overall['Accuracy']
+  permuted_accuracies <- numeric(n_permutations)
+  
+  pb <- txtProgressBar(min = 0, max = n_permutations, style = 3)
+  for(i in 1:n_permutations) {
+    permuted_data <- test_data
+    permuted_data$Diagnosis <- sample(permuted_data$Diagnosis)
+    permuted_accuracies[i] <- confusionMatrix(predict(model, permuted_data), permuted_data$Diagnosis)$overall['Accuracy']
+    setTxtProgressBar(pb, i)
+  }
+  close(pb)
+  
+  p_value <- mean(permuted_accuracies >= observed_accuracy)
+  return(list(observed_accuracy = observed_accuracy, 
+              permuted_accuracies = permuted_accuracies, 
+              p_value = p_value))
+}
+
+# 定义函数计算模型性能指标
+calculate_performance <- function(model, data, model_name = "") {
+  pred <- predict(model, newdata = data)
+  prob <- if (inherits(model, "randomForest")) {
+    predict(model, newdata = data, type = "prob")[,2]
+  } else {
+    predict(model, newdata = data, type = "prob")[,2]
+  }
+  positive_class <- levels(data$Diagnosis)[2]
+  cm <- confusionMatrix(pred, data$Diagnosis, positive = positive_class)
+  roc_obj <- tryCatch({
+    roc(response = data$Diagnosis, 
+        predictor = prob,
+        levels = levels(data$Diagnosis),
+        direction = "<",
+        quiet = TRUE)
+  }, error = function(e) {
+    message("ROC calculation error: ", e$message)
+    return(NULL)
+  })
+  auc_value <- if(!is.null(roc_obj)) auc(roc_obj) else NA
+  auc_ci <- if(!is.null(roc_obj)) {
+    ci.auc(roc_obj, method = "bootstrap", boot.n = 2000)  # 使用bootstrap方法
+  } else {
+    c(NA, NA, NA)
+  }
+  
+  return(list(
+    model_name = model_name,
+    accuracy = cm$overall["Accuracy"],
+    sensitivity = cm$byClass["Sensitivity"],
+    specificity = cm$byClass["Specificity"],
+    auc = auc_value,
+    auc_ci_lower = auc_ci[1],  
+    auc_ci_upper = auc_ci[3],  
+    confusion_matrix = cm,
+    roc_obj = roc_obj
+  ))
+}
+
+# 读取数据
+diff_brain_TD_PIGD <- read.csv("D:/PD/Imagings/SUVR/CentrumSemiovale_1/TD_PIGD/TD_PIGD_Wholebrain/MODELS/FinalFeature.csv")
+diff_brain_TD_PIGD <- diff_brain_TD_PIGD[, -c(1:4)] 
+diff_brain_TD_PIGD[,1] <- factor(diff_brain_TD_PIGD[,1], labels = c("Class0", "Class1"))
+names(diff_brain_TD_PIGD)[1] <- "Diagnosis" 
+
+# 8：2划分训练集和测试集
+set.seed(400)
+trainid <- createDataPartition(y = diff_brain_TD_PIGD$Diagnosis, p = 0.80, list = FALSE)
+traindata <- diff_brain_TD_PIGD[trainid, ]
+testdata <- diff_brain_TD_PIGD[-trainid, ]
+
+# 数据标准化（排除分类变量）
+preProc <- preProcess(traindata[, -1], method = c("center", "scale"))
+traindata[, -1] <- predict(preProc, traindata[, -1])
+testdata[, -1] <- predict(preProc, testdata[, -1])
+
+# 定义交叉验证控制参数（10折交叉验证）
+ctrl <- trainControl(method = "repeatedcv", 
+                     number = 10,
+                     repeats = 5,
+                     classProbs = TRUE,
+                     summaryFunction = twoClassSummary,
+                     savePredictions = TRUE)
+
+# 1. 逻辑回归模型
+set.seed(400)
+logit_grid <- expand.grid(
+  alpha = seq(0, 1, by = 0.1), 
+  lambda = 10^seq(-4, 0, length.out = 20) 
+)
+logit_model <- train(
+  Diagnosis ~ .,
+  data = traindata,
+  method = "glmnet",
+  family = "binomial",
+  trControl = ctrl,
+  tuneGrid = logit_grid,
+  metric = "ROC"
+)
+
+print(logit_model)
+best_grid_lg <- logit_model$bestTune
+cat("Best hyperparameters:\n")
+print(best_grid_lg)
+
+# 使用最优超参数重新训练最终模型
+final_model_lg <- train(
+  Diagnosis ~ .,
+  data = traindata,
+  method = "glmnet",
+  family = "binomial",
+  trControl = trainControl(method = "none", classProbs = TRUE),
+  tuneGrid = best_grid_lg,
+  metric = "ROC"
+)
+
+# 评估模型
+train_perf_lg <- calculate_performance(final_model_lg, traindata, "LG (Train)")
+test_perf_lg <- calculate_performance(final_model_lg, testdata, "LG (Test)")
+
+# 2. SVM模型
+set.seed(400)
+svm_grid <- expand.grid(sigma = 2^seq(-5, 1, by = 1),
+                        C = 2^seq(-3, 3, by = 1))
+svm_model <- train(Diagnosis ~ .,
+                   data = traindata,
+                   method = "svmRadial",
+                   trControl = ctrl,
+                   tuneGrid = svm_grid,
+                   metric = "ROC")
+
+print(svm_model)
+best_svm_grid <- svm_model$bestTune
+cat("Best hyperparameters:\n")
+print(best_svm_grid)
+
+# 使用最优超参数重新训练最终模型
+final_model_svm <- train(
+  Diagnosis ~ .,
+  data = traindata,
+  method = "svmRadial",
+  trControl = trainControl(method = "none", classProbs = TRUE), 
+  tuneGrid = best_svm_grid,
+  metric = "ROC"
+)
+
+# 评估模型
+train_perf_svm <- calculate_performance(final_model_svm, traindata, "SVM (Train)")
+test_perf_svm <- calculate_performance(final_model_svm, testdata, "SVM (Test)")
+
+# 3. 随机森林模型
+set.seed(400)
+rf_grid <- expand.grid(mtry = seq(2, sqrt(ncol(traindata)-1), length.out = 3))
+rf_model <- train(Diagnosis ~ .,
+                  data = traindata,
+                  method = "rf",
+                  trControl = ctrl,
+                  tuneGrid = rf_grid,
+                  importance = TRUE,
+                  metric = "ROC")
+
+print(rf_model)
+best_mtry_rf <- rf_model$bestTune$mtry
+cat("最佳 mtry 参数:", best_mtry_rf, "\n")
+
+# 使用最优超参数重新训练最终模型
+final_model_rf <- randomForest(Diagnosis ~ .,
+                               data = traindata,
+                               mtry = best_mtry_rf,
+                               importance = TRUE)
+
+# 评估模型
+train_perf_rf <- calculate_performance(final_model_rf, traindata, "RF (Train)")
+test_perf_rf <- calculate_performance(final_model_rf, testdata, "RF (Test)")
+
+# 对每个模型-测试数据对运行置换检验
+model_test_pairs <- list(
+  LG = list(model = final_model_lg, test_data = testdata),
+  SVM = list(model = final_model_svm, test_data = testdata),
+  RF = list(model = final_model_rf, test_data = testdata))
+
+set.seed(123)
+permutation_results <- purrr::map(model_test_pairs, ~ {
+  permutation_test(.x$model, .x$test_data, n_permutations = 1000)
+})
+
+# 汇总模型性能结果
+performance_results <- list(
+  train_perf_lg, test_perf_lg,
+  train_perf_svm, test_perf_svm,
+  train_perf_rf, test_perf_rf
+)
+
+# 创建结果数据框
+results_df <- data.frame(
+  Model = sapply(performance_results, function(x) x$model_name),
+  Accuracy = sapply(performance_results, function(x) x$accuracy),
+  Sensitivity = sapply(performance_results, function(x) x$sensitivity),
+  Specificity = sapply(performance_results, function(x) x$specificity),
+  AUC = sapply(performance_results, function(x) x$auc),
+  AUC_CI_Lower = sapply(performance_results, function(x) x$auc_ci_lower),  
+  AUC_CI_Upper = sapply(performance_results, function(x) x$auc_ci_upper),
+  stringsAsFactors = FALSE
+)
+
+# 添加置换检验的p值
+results_df$Permutation_p_value <- NA
+results_df$Permutation_p_value[results_df$Model == "LG (Test)"] <- permutation_results$LG$p_value
+results_df$Permutation_p_value[results_df$Model == "SVM (Test)"] <- permutation_results$SVM$p_value
+results_df$Permutation_p_value[results_df$Model == "RF (Test)"] <- permutation_results$RF$p_value
+
+# 打印结果
+print("模型性能汇总:")
+print(results_df)
+
+# 打印混淆矩阵
+cat("\n=== Confusion Matrices ===\n")
+cat("\nLG model (Train):\n")
+print(train_perf_lg$confusion_matrix)
+cat("\nLG model (Test):\n")
+print(test_perf_lg$confusion_matrix)
+cat("\nSVM model (Train):\n")
+print(train_perf_svm$confusion_matrix)
+cat("\nSVM model (Test):\n")
+print(test_perf_svm$confusion_matrix)
+cat("\nRF model (Train):\n")
+print(train_perf_rf$confusion_matrix)
+cat("\nRF model (Test):\n")
+print(test_perf_rf$confusion_matrix)
+
+# 自定义主题
+custom_theme <- theme(
+  panel.background = element_blank(),
+  panel.border = element_rect(fill = NA, color = "black"),
+  legend.position = c(0.95, 0.05),  # 右下角坐标
+  legend.justification = c(1, 0),    # 对齐基准点
+  legend.background = element_rect(fill = "white", color = "black"),
+  legend.title = element_blank(),
+  legend.text = element_text(size = 11, face = "bold"),  # 加粗图例文字
+  axis.text = element_text(size = 10),
+  axis.title = element_text(size = 12),
+  plot.title = element_text(size = 14, face = "bold", hjust = 0.5)
+)
+
+# 准备训练集ROC数据
+train_roc_data <- list(
+  "Logistic Regression" = train_perf_lg$roc_obj,
+  "SVM" = train_perf_svm$roc_obj,
+  "Random Forest" = train_perf_rf$roc_obj
+)
+
+# 准备测试集ROC数据
+test_roc_data <- list(
+  "Logistic Regression" = test_perf_lg$roc_obj,
+  "SVM" = test_perf_svm$roc_obj,
+  "Random Forest" = test_perf_rf$roc_obj
+)
+
+# 绘制训练组ROC曲线
+train_legend_labels <- c(
+  paste0("LG AUC = ", round(auc(train_perf_lg$roc_obj), 3)),
+  paste0("SVM AUC = ", round(auc(train_perf_svm$roc_obj), 3)), 
+  paste0("RF AUC = ", round(auc(train_perf_rf$roc_obj), 3))
+)
+
+train_roc_plot <- ggroc(train_roc_data, legacy.axes = TRUE, size = 1) +
+  geom_segment(aes(x = 0, xend = 1, y = 0, yend = 1), 
+               color = "grey", linetype = "dashed") +
+  scale_color_manual(
+    values = c("#E41A1C", "#377EB8", "#4DAF4A"),
+    labels = train_legend_labels
+  ) +
+  labs(x = "False Positive Rate (1 - Specificity)", 
+       y = "True Positive Rate (Sensitivity)",
+       title = "ROC Curves (Training Set)") +
+  custom_theme +
+  guides(color = guide_legend(override.aes = list(size = 2)))
+
+# 绘制测试组ROC曲线
+test_legend_labels <- c(
+  paste0("LG AUC = ", round(auc(test_perf_lg$roc_obj), 3)), 
+  paste0("SVM AUC = ", round(auc(test_perf_svm$roc_obj), 3)),
+  paste0("RF AUC = ", round(auc(test_perf_rf$roc_obj), 3))
+)
+
+test_roc_plot <- ggroc(test_roc_data, legacy.axes = TRUE, size = 1.5) +
+  geom_segment(aes(x = 0, xend = 1, y = 0, yend = 1), 
+               color = "grey", linetype = "dashed") +
+  scale_color_manual(values = c("#E41A1C", "#377EB8", "#4DAF4A"), 
+                     labels = test_legend_labels) +
+  labs(x = "False Positive Rate (1 - Specificity)", 
+       y = "True Positive Rate (Sensitivity)",
+       title = "ROC Curves (Test Set)") +
+  custom_theme +
+  guides(color = guide_legend(override.aes = list(size = 2)))
+
+# 显示图形
+print(train_roc_plot)
+print(test_roc_plot)
+
+# 保存图形
+ggsave("D:/PD/Imagings/SUVR/CentrumSemiovale_1/TD_PIGD/TD_PIGD_Wholebrain/MODELS/ROC_Train_LGRFSVM.png", 
+       train_roc_plot, width = 6, height = 6, dpi = 300)
+ggsave("D:/PD/Imagings/SUVR/CentrumSemiovale_1/TD_PIGD/TD_PIGD_Wholebrain/MODELS/ROC_Test_LGRF_SVM.png", 
+       test_roc_plot, width = 6, height = 6, dpi = 300)
