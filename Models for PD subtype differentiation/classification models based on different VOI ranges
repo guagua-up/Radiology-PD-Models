@@ -1,0 +1,482 @@
+# 清除环境变量
+rm(list = ls())
+
+# 安装并加载所需包
+required_packages <- c("e1071", "caret", "pROC", "randomForest", "ggplot2", 
+                       "ROCR", "ggpubr", "purrr", "dplyr", "tidyr", "patchwork")
+for(pkg in required_packages){
+  if(!require(pkg, character.only = TRUE)){
+    install.packages(pkg)
+    library(pkg, character.only = TRUE)
+  }
+}
+
+# 定义函数执行置换检验
+permutation_test <- function(model, test_data, n_permutations = 1000) {
+  positive_class <- levels(test_data$Diagnosis)[2]
+  observed_accuracy <- confusionMatrix(predict(model, test_data), 
+                                       test_data$Diagnosis, 
+                                       positive = positive_class)$overall['Accuracy']
+  permuted_accuracies <- numeric(n_permutations)
+  
+  pb <- txtProgressBar(min = 0, max = n_permutations, style = 3)
+  for(i in 1:n_permutations) {
+    permuted_data <- test_data
+    permuted_data$Diagnosis <- sample(permuted_data$Diagnosis)
+    permuted_accuracies[i] <- confusionMatrix(predict(model, permuted_data), 
+                                              permuted_data$Diagnosis,
+                                              positive = positive_class)$overall['Accuracy']
+    setTxtProgressBar(pb, i)
+  }
+  close(pb)
+  
+  p_value <- mean(permuted_accuracies >= observed_accuracy)
+  return(list(observed_accuracy = observed_accuracy, 
+              permuted_accuracies = permuted_accuracies, 
+              p_value = p_value))
+}
+
+# 定义函数计算模型性能指标
+calculate_performance <- function(model, data, model_name = "") {
+  pred <- predict(model, newdata = data)
+  prob <- predict(model, newdata = data, type = "prob")[,2]
+  positive_class <- levels(data$Diagnosis)[2]
+  cm <- confusionMatrix(pred, data$Diagnosis, positive = positive_class)
+  roc_obj <- tryCatch({
+    roc(response = data$Diagnosis, 
+        predictor = prob,
+        levels = levels(data$Diagnosis),
+        direction = "<",
+        ci = TRUE,  
+        quiet = TRUE)
+  }, error = function(e) {
+    message("ROC calculation error: ", e$message)
+    return(NULL)
+  })
+  
+  auc_value <- if(!is.null(roc_obj)) auc(roc_obj) else NA
+  auc_ci <- if(!is.null(roc_obj)) ci(roc_obj) else c(NA, NA, NA)
+  
+  return(list(
+    model_name = model_name,
+    accuracy = cm$overall["Accuracy"],
+    sensitivity = cm$byClass["Sensitivity"],
+    specificity = cm$byClass["Specificity"],
+    auc = auc_value,
+    auc_ci_lower = auc_ci[1],
+    auc_ci_upper = auc_ci[3],
+    confusion_matrix = cm,
+    roc_obj = roc_obj
+  ))
+}
+
+# 定义交叉验证控制参数（10折交叉验证）
+ctrl <- trainControl(method = "repeatedcv", 
+                     number = 10,
+                     repeats = 5,
+                     classProbs = TRUE,
+                     summaryFunction = twoClassSummary,
+                     savePredictions = TRUE)
+
+## 全脑模型
+# 读取数据（添加错误处理）
+tryCatch({
+  Wholebrain <- read.csv("D:/PD/Imagings/SUVR/CentrumSemiovale_1/TD_PIGD/TD_PIGD_Wholebrain/MODELS/FinalFeature.csv")
+  Wholebrain <- Wholebrain[, -c(1:4)] 
+  Wholebrain[,1] <- factor(Wholebrain[,1], levels = c(0, 1), labels = c("Class0", "Class1"))
+  names(Wholebrain)[1] <- "Diagnosis"
+  
+  # 添加数据检查
+  if(nrow(Wholebrain) < 20) stop("Insufficient samples in Wholebrain data")
+  if(length(unique(Wholebrain$Diagnosis)) < 2) stop("Only one class present in Wholebrain data")
+}, error = function(e) {
+  stop("Error loading Wholebrain data: ", e$message)
+})
+
+# 检查零方差特征
+nzv <- nearZeroVar(Wholebrain)
+if(length(nzv) > 0) {
+  message("Removing near zero variance features from Wholebrain data: ", 
+          paste(colnames(Wholebrain)[nzv], collapse = ", "))
+  Wholebrain <- Wholebrain[, -nzv]
+}
+
+# 8:2划分训练集和测试集
+set.seed(400)
+trainid_wb <- createDataPartition(y = Wholebrain$Diagnosis, p = 0.80, list = FALSE)
+traindata_wb <- Wholebrain[trainid_wb, ]
+testdata_wb <- Wholebrain[-trainid_wb, ]
+
+# 数据标准化（排除分类变量）
+preProc_wb <- preProcess(traindata_wb[, -1], method = c("center", "scale"))
+traindata_wb[, -1] <- predict(preProc_wb, traindata_wb[, -1])
+testdata_wb[, -1] <- predict(preProc_wb, testdata_wb[, -1])
+
+# 训练模型
+set.seed(400)
+mtry_max <- min(20, sqrt(ncol(traindata_wb)-1))  
+rf_grid_wb <- expand.grid(mtry = seq(2, mtry_max, length.out = 3))
+rf_model_wb <- train(Diagnosis ~ .,
+                     data = traindata_wb,
+                     method = "rf",
+                     trControl = ctrl,
+                     tuneGrid = rf_grid_wb,
+                     importance = TRUE,
+                     metric = "ROC")
+# 查看交叉验证的结果
+print(rf_model_wb)
+best_mtry_wb <- rf_model_wb$bestTune$mtry
+cat("最佳 mtry 参数 (WB):", best_mtry_wb, "\n")
+
+# 使用最优超参数重新训练最终模型
+final_model_wb <- randomForest(Diagnosis ~ .,
+                               data = traindata_wb,
+                               mtry = best_mtry_wb,
+                               importance = TRUE)
+
+# 评估模型
+train_perf_wb <- calculate_performance(final_model_wb, traindata_wb, "WB (Train)")
+test_perf_wb <- calculate_performance(final_model_wb, testdata_wb, "WB (Test)")
+
+# 变量重要性
+var_imp_wb <- varImp(rf_model_wb, scale = TRUE)
+imp_data_wb <- as.data.frame(var_imp_wb$importance) %>%
+  mutate(Feature = rownames(.),
+         Importance = (Class0 + Class1)/2)  # 计算两类平均重要性
+
+imp_wb <- ggplot(
+  imp_data_wb,
+  aes(x = reorder(Feature, Importance), y = Importance)
+) +
+  geom_col(fill = "steelblue", width = 0.6) +
+  labs(title = "Feature Importance", x = "", y = "Importance") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.y = element_blank()
+  ) +
+  coord_flip()
+
+## ONS模型
+# 读取数据
+tryCatch({
+  ONS <- read.csv("D:/PD/Imagings/SUVR/CentrumSemiovale_1/TD_PIGD/TD_PIGD_OTHERS/FinalFeature_ons.csv")
+  ONS <- ONS[, -c(1:4)]
+  ONS[,1] <- factor(ONS[,1], levels = c(0, 1), labels = c("Class0", "Class1"))
+  names(ONS)[1] <- "Diagnosis"
+  
+  # 添加数据检查
+  if(nrow(ONS) < 20) stop("Insufficient samples in ONS data")
+  if(length(unique(ONS$Diagnosis)) < 2) stop("Only one class present in ONS data")
+}, error = function(e) {
+  stop("Error loading ONS data: ", e$message)
+})
+
+# 检查零方差特征
+nzv <- nearZeroVar(ONS)
+if(length(nzv) > 0) {
+  message("Removing near zero variance features from ONS data: ", 
+          paste(colnames(ONS)[nzv], collapse = ", "))
+  ONS <- ONS[, -nzv]
+}
+
+# 8:2划分训练集和测试集
+set.seed(400)
+trainid_ons <- createDataPartition(y = ONS$Diagnosis, p = 0.80, list = FALSE)
+traindata_ons <- ONS[trainid_ons, ]
+testdata_ons <- ONS[-trainid_ons, ]
+
+# 数据标准化
+preProc_ons <- preProcess(traindata_ons[, -1], method = c("center", "scale"))
+traindata_ons[, -1] <- predict(preProc_ons, traindata_ons[, -1])
+testdata_ons[, -1] <- predict(preProc_ons, testdata_ons[, -1])
+
+# 训练模型
+set.seed(400)
+mtry_max <- min(20, sqrt(ncol(traindata_ons)-1))
+rf_grid_ons <- expand.grid(mtry = seq(2, mtry_max, length.out = 3))
+rf_model_ons <- train(Diagnosis ~ .,
+                      data = traindata_ons,
+                      method = "rf",
+                      trControl = ctrl,
+                      tuneGrid = rf_grid_ons,
+                      importance = TRUE,
+                      metric = "ROC")
+# 查看交叉验证的结果
+print(rf_model_ons)
+best_mtry_ons <- rf_model_ons$bestTune$mtry
+cat("最佳 mtry 参数 (ONS):", best_mtry_ons, "\n")
+
+# 使用最优超参数重新训练最终模型
+final_model_ons <- randomForest(Diagnosis ~ .,
+                                data = traindata_ons,
+                                mtry = best_mtry_ons,
+                                importance = TRUE)
+# 评估模型
+train_perf_ons <- calculate_performance(final_model_ons, traindata_ons, "ONS (Train)")
+test_perf_ons <- calculate_performance(final_model_ons, testdata_ons, "ONS (Test)")
+
+# 变量重要性
+var_imp_ons <- varImp(rf_model_ons, scale = TRUE)
+imp_data_ons <- as.data.frame(var_imp_ons$importance) %>%
+  mutate(Feature = rownames(.),
+         Importance = (Class0 + Class1)/2)  # 计算两类平均重要性
+
+imp_ons <- ggplot(
+  imp_data_ons,
+  aes(x = reorder(Feature, Importance), y = Importance)
+) +
+  geom_col(fill = "steelblue", width = 0.6) +
+  labs(title = "Feature Importance", x = "", y = "Importance") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.y = element_blank()
+  ) +
+  coord_flip()
+
+## NS模型
+# 读取数据
+tryCatch({
+  NS <- read.csv("D:/PD/Imagings/SUVR/CentrumSemiovale_1/TD_PIGD/TD_PIGD_SN/FinalFeature.csv")
+  NS <- NS[, -c(1:4)]
+  NS[,1] <- factor(NS[,1], levels = c(0, 1), labels = c("Class0", "Class1"))
+  names(NS)[1] <- "Diagnosis"
+  
+  # 添加数据检查
+  if(nrow(NS) < 20) stop("Insufficient samples in NS data")
+  if(length(unique(NS$Diagnosis)) < 2) stop("Only one class present in NS data")
+}, error = function(e) {
+  stop("Error loading NS data: ", e$message)
+})
+
+# 检查零方差特征
+nzv <- nearZeroVar(NS)
+if(length(nzv) > 0) {
+  message("Removing near zero variance features from NS data: ", 
+          paste(colnames(NS)[nzv], collapse = ", "))
+  NS <- NS[, -nzv]
+}
+
+# 8:2划分训练集和测试集
+set.seed(400)
+trainid_ns <- createDataPartition(y = NS$Diagnosis, p = 0.80, list = FALSE)
+traindata_ns <- NS[trainid_ns, ]
+testdata_ns <- NS[-trainid_ns, ]
+
+# 数据标准化
+preProc_ns <- preProcess(traindata_ns[, -1], method = c("center", "scale"))
+traindata_ns[, -1] <- predict(preProc_ns, traindata_ns[, -1])
+testdata_ns[, -1] <- predict(preProc_ns, testdata_ns[, -1])
+
+# 训练模型
+set.seed(400)
+mtry_max <- min(20, sqrt(ncol(traindata_ns)-1))
+rf_grid_ns <- expand.grid(mtry = seq(2, mtry_max, length.out = 3))
+rf_model_ns <- train(Diagnosis ~ .,
+                     data = traindata_ns,
+                     method = "rf",
+                     trControl = ctrl,
+                     tuneGrid = rf_grid_ns,
+                     importance = TRUE,
+                     metric = "ROC")
+# 查看交叉验证的结果
+print(rf_model_ns)
+best_mtry_ns <- rf_model_ns$bestTune$mtry
+cat("最佳 mtry 参数 (NS):", best_mtry_ns, "\n")
+
+# 使用最优超参数重新训练最终模型
+final_model_ns <- randomForest(Diagnosis ~ .,
+                               data = traindata_ns,
+                               mtry = best_mtry_ns,
+                               importance = TRUE)
+# 评估模型
+train_perf_ns <- calculate_performance(final_model_ns, traindata_ns, "NS (Train)")
+test_perf_ns <- calculate_performance(final_model_ns, testdata_ns, "NS (Test)")
+
+# 变量重要性
+var_imp_ns <- varImp(rf_model_ns, scale = TRUE)
+imp_data_ns <- as.data.frame(var_imp_ns$importance) %>%
+  mutate(Feature = rownames(.),
+         Importance = (Class0 + Class1)/2)  # 计算两类平均重要性
+
+imp_ns <- ggplot(
+  imp_data_ns,
+  aes(x = reorder(Feature, Importance), y = Importance)
+) +
+  geom_col(fill = "steelblue", width = 0.6) +
+  labs(title = "Feature Importance", x = "", y = "Importance") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.y = element_blank()
+  ) +
+  coord_flip()
+
+print(imp_wb)
+print(imp_ons)
+print(imp_ns)
+# 保存特征重要性图
+ggsave("D:/PD/Imagings/SUVR/CentrumSemiovale_1/TD_PIGD/TD_PIGD_Wholebrain/MODELS/Feature_Importance_WB.png", 
+       imp_wb, width = 6, height = 8, dpi = 300)
+ggsave("D:/PD/Imagings/SUVR/CentrumSemiovale_1/TD_PIGD/TD_PIGD_Wholebrain/MODELS/Feature_Importance_ONS.png", 
+       imp_ons, width = 6, height = 8, dpi = 300)
+ggsave("D:/PD/Imagings/SUVR/CentrumSemiovale_1/TD_PIGD/TD_PIGD_Wholebrain/MODELS/Feature_Importance_NS.png", 
+       imp_ns, width = 6, height = 8, dpi = 300)
+
+# 对每个模型-测试数据对运行置换检验
+model_test_pairs <- list(
+  NS = list(model = rf_model_ns, test_data = testdata_ns),
+  ONS = list(model = rf_model_ons, test_data = testdata_ons),
+  WB = list(model = rf_model_wb, test_data = testdata_wb))
+
+set.seed(123)
+results <- purrr::map(model_test_pairs, ~ {
+  permutation_test(.x$model, .x$test_data, n_permutations = 1000)
+})
+
+# 汇总所有性能结果
+all_performance <- purrr::map_dfr(
+  list(
+    list(data = train_perf_ns, set = "Train"),
+    list(data = test_perf_ns, set = "Test"),
+    list(data = train_perf_ons, set = "Train"),
+    list(data = test_perf_ons, set = "Test"),
+    list(data = train_perf_wb, set = "Train"),
+    list(data = test_perf_wb, set = "Test")
+  ),
+  function(x) {
+    data.frame(
+      model_name = x$data$model_name,
+      accuracy = as.numeric(x$data$accuracy),
+      sensitivity = as.numeric(x$data$sensitivity),
+      specificity = as.numeric(x$data$specificity),
+      auc = if(!is.null(x$data$auc)) as.numeric(x$data$auc) else NA_real_,
+      auc_ci_lower = if(!is.null(x$data$auc_ci_lower)) as.numeric(x$data$auc_ci_lower) else NA_real_,
+      auc_ci_upper = if(!is.null(x$data$auc_ci_upper)) as.numeric(x$data$auc_ci_upper) else NA_real_,
+      Set = x$set,
+      stringsAsFactors = FALSE
+    )
+  }
+) %>%
+  separate(model_name, into = c("Model", "Set2"), sep = " \\(", remove = FALSE) %>%
+  mutate(Set = ifelse(is.na(Set2), Set, gsub("\\)", "", Set2))) %>%
+  select(-Set2)
+
+# 添加置换检验的p值
+p_values <- data.frame(
+  Model = c("NS", "ONS", "WB"),
+  P_Value = c(results$NS$p_value, results$ONS$p_value, results$WB$p_value)
+)
+
+final_results <- all_performance %>%
+  left_join(p_values, by = "Model") %>%
+  select(
+    Model, 
+    Set, 
+    Accuracy = accuracy, 
+    Sensitivity = sensitivity, 
+    Specificity = specificity, 
+    AUC = auc,
+    AUC_CI_Lower = auc_ci_lower,  # 添加 AUC 95% CI 下限
+    AUC_CI_Upper = auc_ci_upper,  # 添加 AUC 95% CI 上限
+    P_Value
+  ) %>%
+  mutate(across(where(is.numeric), ~round(., 3))) %>%  # 对所有数值列四舍五入
+  arrange(Model, desc(Set))
+
+# 打印最终结果
+print(final_results)
+
+# 打印混淆矩阵
+cat("\n=== Confusion Matrices ===\n")
+cat("\nNS model (Train):\n")
+print(train_perf_ns$confusion_matrix)
+cat("\nNS model (Test):\n")
+print(test_perf_ns$confusion_matrix)
+cat("\nONS model (Train):\n")
+print(train_perf_ons$confusion_matrix)
+cat("\nONS model (Test):\n")
+print(test_perf_ons$confusion_matrix)
+cat("\nWB model (Train):\n")
+print(train_perf_wb$confusion_matrix)
+cat("\nWB model (Test):\n")
+print(test_perf_wb$confusion_matrix)
+
+# 准备训练组和测试组的ROC数据
+train_roc_data <- list(
+  NS = train_perf_ns$roc_obj,
+  ONS = train_perf_ons$roc_obj,
+  WB = train_perf_wb$roc_obj
+)
+
+test_roc_data <- list(
+  NS = test_perf_ns$roc_obj,
+  ONS = test_perf_ons$roc_obj,
+  WB = test_perf_wb$roc_obj
+)
+
+# 自定义主题（与参考样式一致）
+custom_theme <- theme(
+  panel.background = element_blank(),
+  panel.border = element_rect(fill = NA, color = "black"),
+  legend.position = c(0.95, 0.05),  # 右下角坐标
+  legend.justification = c(1, 0),    # 对齐基准点
+  legend.background = element_rect(fill = "white", color = "black"),
+  legend.title = element_blank(),
+  legend.text = element_text(size = 11, face = "bold"),  
+  axis.text = element_text(size = 10),
+  axis.title = element_text(size = 12),
+  plot.title = element_text(size = 14, face = "bold", hjust = 0.5)
+)
+
+# 绘制训练组ROC曲线
+train_legend_labels <- c(
+  paste0("NS AUC = ", round(auc(train_perf_ns$roc_obj), 3)),
+  paste0("ONS AUC = ", round(auc(train_perf_ons$roc_obj), 3)),
+  paste0("WB AUC = ", round(auc(train_perf_wb$roc_obj), 3))
+)
+
+train_roc_plot <- ggroc(train_roc_data, legacy.axes = TRUE, size = 1) +
+  geom_segment(aes(x = 0, xend = 1, y = 0, yend = 1), 
+               color = "grey", linetype = "dashed") +
+  scale_color_manual(
+    values = c("#E41A1C", "#377EB8", "#4DAF4A"),
+    labels = train_legend_labels
+  ) +
+  labs(x = "False Positive Rate (1 - Specificity)", 
+       y = "True Positive Rate (Sensitivity)",
+       title = "ROC Curves (Training Set)") +
+  custom_theme +
+  guides(color = guide_legend(override.aes = list(size = 2)))
+
+# 绘制测试组ROC曲线
+test_legend_labels <- c(
+  paste0("NS AUC = ", round(auc(test_perf_ns$roc_obj), 3)),
+  paste0("ONS AUC = ", round(auc(test_perf_ons$roc_obj), 3)),
+  paste0("WB AUC = ", round(auc(test_perf_wb$roc_obj), 3))
+)
+
+test_roc_plot <- ggroc(test_roc_data, legacy.axes = TRUE, size = 1.5) +
+  geom_segment(aes(x = 0, xend = 1, y = 0, yend = 1), 
+               color = "grey", linetype = "dashed") +
+  scale_color_manual(values = c("#E41A1C", "#377EB8", "#4DAF4A"), 
+                     labels = test_legend_labels) +
+  labs(x = "False Positive Rate (1 - Specificity)", 
+       y = "True Positive Rate (Sensitivity)",
+       title = "ROC Curves (Test Set)") +
+  custom_theme +
+  guides(color = guide_legend(override.aes = list(size = 2)))
+
+# 显示图形
+print(train_roc_plot)
+print(test_roc_plot)
+
+# 保存图形
+ggsave("D:/PD/Imagings/SUVR/CentrumSemiovale_1/TD_PIGD/TD_PIGD_Wholebrain/MODELS/ROC_Train.png", 
+       train_roc_plot, width = 6, height = 6, dpi = 300)
+ggsave("D:/PD/Imagings/SUVR/CentrumSemiovale_1/TD_PIGD/TD_PIGD_Wholebrain/MODELS/ROC_Test.png", 
+       test_roc_plot, width = 6, height = 6, dpi = 300)
