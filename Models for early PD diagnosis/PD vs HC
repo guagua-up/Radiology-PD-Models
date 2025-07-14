@@ -1,0 +1,200 @@
+# 清除环境变量
+rm(list = ls())
+
+# 安装并加载所需包
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(e1071, caret, pROC, randomForest, ggplot2, ROCR, ggpubr, dplyr, tidyr, purrr, doParallel, broom)
+
+# 启用并行计算
+cl <- makePSOCKcluster(detectCores() - 1)
+registerDoParallel(cl)
+
+# 定义性能指标计算函数
+calculate_metrics <- function(pred, obs) {
+  cm <- confusionMatrix(pred, obs, positive = "PD")
+  roc_obj <- roc(response = obs, 
+                 predictor = as.numeric(pred == "PD"),
+                 levels = c("HC", "PD"),
+                 direction = "<")
+  
+  return(list(
+    Accuracy = cm$overall["Accuracy"],
+    Sensitivity = cm$byClass["Sensitivity"],
+    Specificity = cm$byClass["Specificity"],
+    AUC = auc(roc_obj),
+    CM = cm
+  ))
+}
+
+# 定义置换检验函数
+permutation_test <- function(model, data, n_permutations = 1000) {
+  # 计算观察到的准确率
+  obs_pred <- predict(model, data)
+  obs_accuracy <- confusionMatrix(obs_pred, data$Diagnosis)$overall['Accuracy']
+  
+  # 初始化进度条
+  pb <- txtProgressBar(min = 0, max = n_permutations, style = 3)
+  
+  # 并行计算置换结果
+  permuted_accuracies <- foreach(i = 1:n_permutations, .combine = 'c') %dopar% {
+    permuted_data <- data
+    permuted_data$Diagnosis <- sample(permuted_data$Diagnosis)
+    perm_pred <- predict(model, permuted_data)
+    perm_acc <- confusionMatrix(perm_pred, permuted_data$Diagnosis)$overall['Accuracy']
+    setTxtProgressBar(pb, i)
+    perm_acc
+  }
+  close(pb)
+  
+  # 计算p值
+  p_value <- mean(permuted_accuracies >= obs_accuracy)
+  
+  return(list(observed_accuracy = obs_accuracy,
+              permuted_accuracies = permuted_accuracies,
+              p_value = p_value))
+}
+
+# 读取数据
+data <- read.csv("D:/PD/Imagings/SUVR/CentrumSemiovale_1/HC_PD/HC_PD_Wholebrain/MODELS/FinalFeature.csv")
+data <- data[, -c(1:4)] %>%  # 移除非特征列
+  mutate(Diagnosis = factor(Diagnosis, levels = c(0, 1), 
+                            labels = c("HC", "PD"))) 
+         names(data)[1] <- "Diagnosis"
+         
+         # 设置随机种子
+         set.seed(123)
+         
+         # 定义10×5交叉验证控制参数
+         ctrl <- trainControl(
+           method = "repeatedcv",
+           number = 10,
+           repeats = 5,
+           classProbs = TRUE,
+           summaryFunction = twoClassSummary,
+           savePredictions = "final",
+           allowParallel = TRUE,
+           verboseIter = FALSE
+         )
+         
+         # 定义模型训练函数
+         train_models <- function(data, ctrl) {
+           # 逻辑回归
+           logit_model <- train(Diagnosis ~ .,
+                                data = data,
+                                method = "glm",
+                                family = "binomial",
+                                trControl = ctrl,
+                                metric = "ROC")
+           
+           # SVM - 径向基核
+           svm_model <- train(Diagnosis ~ .,
+                              data = data,
+                              method = "svmRadial",
+                              trControl = ctrl,
+                              tuneLength = 5,
+                              metric = "ROC")
+           
+           # 随机森林
+           rf_model <- train(Diagnosis ~ .,
+                             data = data,
+                             method = "rf",
+                             trControl = ctrl,
+                             tuneLength = 5,
+                             importance = TRUE,
+                             metric = "ROC")
+           
+           return(list(
+             logistic = logit_model,
+             svm = svm_model,
+             random_forest = rf_model
+           ))
+         }
+         
+         # 训练所有模型
+         models <- train_models(data, ctrl)
+         
+         # 结果汇总函数
+         results_summary <- purrr::map_dfr(models, function(model) {
+           # 1. 安全地处理预测结果
+           preds <- tryCatch({
+             model$pred %>% 
+               mutate(
+                 pred_class = factor(ifelse(PD > 0.5, "PD", "HC")),
+                 obs = factor(obs, levels = c("HC", "PD"))
+               )
+           }, error = function(e) {
+             message("Error processing predictions: ", e$message)
+             NULL
+           })
+           
+           if (is.null(preds)) return(NULL)
+           
+           # 2. 计算各折叠指标
+           fold_metrics <- tryCatch({
+             preds %>% 
+               group_by(Resample) %>% 
+               summarise(
+                 Accuracy = mean(pred_class == obs, na.rm = TRUE),
+                 Sensitivity = sum(pred_class == "PD" & obs == "PD", na.rm = TRUE) / 
+                   max(1, sum(obs == "PD", na.rm = TRUE)),
+                 Specificity = sum(pred_class == "HC" & obs == "HC", na.rm = TRUE) / 
+                   max(1, sum(obs == "HC", na.rm = TRUE)),
+                 AUC = as.numeric(pROC::auc(pROC::roc(obs, PD, quiet = TRUE))),
+                 .groups = "drop"
+               )
+           }, error = function(e) {
+             message("Error calculating fold metrics: ", e$message)
+             NULL
+           })
+           
+           if (is.null(fold_metrics)) return(NULL)
+           
+           # 3. 返回汇总结果
+           tibble(
+             Model = class(model$finalModel)[1],
+             Accuracy = mean(fold_metrics$Accuracy, na.rm = TRUE),
+             Sensitivity = mean(fold_metrics$Sensitivity, na.rm = TRUE),
+             Specificity = mean(fold_metrics$Specificity, na.rm = TRUE),
+             AUC = mean(fold_metrics$AUC, na.rm = TRUE),
+             Accuracy_sd = sd(fold_metrics$Accuracy, na.rm = TRUE),
+             Sensitivity_sd = sd(fold_metrics$Sensitivity, na.rm = TRUE),
+             Specificity_sd = sd(fold_metrics$Specificity, na.rm = TRUE),
+             AUC_sd = sd(fold_metrics$AUC, na.rm = TRUE)
+           )
+         }, .id = "model_type")
+
+         # 对每个模型进行置换检验
+         set.seed(123)
+         registerDoSEQ()  #关闭并行
+         perm_results <- list(
+           logistic = permutation_test(models$logistic, data),
+           svm = permutation_test(models$svm, data),
+           random_forest = permutation_test(models$random_forest, data)
+         )
+         
+         # 美化结果输出并添加置换检验p值
+         final_results <- results_summary %>% 
+           mutate(Model = case_when(
+             model_type == "logistic" ~ "Logistic Regression",
+             model_type == "svm" ~ "SVM (RBF Kernel)",
+             model_type == "random_forest" ~ "Random Forest",
+             TRUE ~ model_type
+           )) %>% 
+           select(Model, 
+                  Accuracy, Accuracy_sd,
+                  Sensitivity, Sensitivity_sd,
+                  Specificity, Specificity_sd,
+                  AUC, AUC_sd) %>% 
+           mutate(across(where(is.numeric), ~ round(., 3))) %>%
+           mutate(
+             Permutation_p_value = case_when(
+               Model == "Logistic Regression" ~ perm_results$logistic$p_value,
+               Model == "SVM (RBF Kernel)" ~ perm_results$svm$p_value,
+               Model == "Random Forest" ~ perm_results$random_forest$p_value,
+               TRUE ~ NA_real_
+             )
+           )
+         
+         # 打印最终结果
+         print("模型性能汇总(10×5 CV)及置换检验结果:")
+         print(final_results)
