@@ -57,7 +57,7 @@ rf_model <- train(Diagnosis ~ ., data = data,
                   importance = TRUE,
                   metric = "ROC")
 
-# 性能指标计算函数（使用模型预测结果）
+# 性能指标计算函数
 calculate_metrics <- function(model) {
   preds <- model$pred %>% 
     group_by(Resample) %>% 
@@ -86,13 +86,10 @@ model_metrics <- list(
   RF = calculate_metrics(rf_model)
 )
 
-# 更稳健的置换检验函数
+# 定义置换检验函数
 permutation_test <- function(model, data, n_perm = 1000) {
-  # 在主进程中计算观察值
   obs_prob <- predict(model, data, type = "prob")[, "Class1"]
   obs_auc <- roc(data$Diagnosis, obs_prob, levels = c("Class0", "Class1"), quiet = TRUE)$auc
-  
-  # 并行计算置换结果
   perm_aucs <- foreach(i = 1:n_perm, .combine = 'c', 
                        .packages = c("pROC", "caret")) %dopar% {
                          perm_data <- data
@@ -100,13 +97,11 @@ permutation_test <- function(model, data, n_perm = 1000) {
                          perm_prob <- predict(model, perm_data, type = "prob")[, "Class1"]
                          roc(perm_data$Diagnosis, perm_prob, levels = c("Class0", "Class1"), quiet = TRUE)$auc
                        }
-  
-  # 计算p值
   p_value <- (sum(perm_aucs >= obs_auc) + 1) / (n_perm + 1)  # 添加1防止p值为0
   return(p_value)
 }
 
-# 执行置换检验（减少置换次数以演示）
+# 执行置换检验
 perm_results <- list(
   Logistic = tryCatch(permutation_test(logit_model, data, 1000),
                       error = function(e) {message("Logistic permutation failed: ", e$message); NA}),
