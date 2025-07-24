@@ -1,242 +1,282 @@
-# 清除环境变量
-rm(list = ls())
+library(tidymodels)
+library(naniar)
+library(future)
+library(pROC)
+library(ggplot2)
+library(patchwork)
+library(vip)
 
-# 安装并加载所需包
-if (!require("pacman")) install.packages("pacman")
-pacman::p_load(e1071, caret, pROC, randomForest, ggplot2, ROCR, ggpubr, dplyr, tidyr, purrr)
+# ==================== WB Model ====================
+# Data preparation
+Wholebrain <- read.csv("D:/PD/LASSO/wb_FinalFeature.csv")
+Wholebrain <- Wholebrain[, -c(1:4)] 
+Wholebrain[,1] <- factor(Wholebrain[,1], levels = c(0, 1), labels = c("Class0", "Class1"))
+names(Wholebrain)[1] <- "Diagnosis"
+str(Wholebrain)
+Wholebrain |> count(Diagnosis)
+miss_var_summary(Wholebrain)
 
-# 定义函数执行置换检验
-permutation_test <- function(model, test_data, n_permutations = 1000) {
-  observed_accuracy <- confusionMatrix(predict(model, test_data), test_data$Diagnosis)$overall['Accuracy']
-  permuted_accuracies <- numeric(n_permutations)
-  
-  pb <- txtProgressBar(min = 0, max = n_permutations, style = 3)
-  for(i in 1:n_permutations) {
-    permuted_data <- test_data
-    permuted_data$Diagnosis <- sample(permuted_data$Diagnosis)
-    permuted_accuracies[i] <- confusionMatrix(predict(model, permuted_data), permuted_data$Diagnosis)$overall['Accuracy']
-    setTxtProgressBar(pb, i)
-  }
-  close(pb)
-  
-  p_value <- mean(permuted_accuracies >= observed_accuracy)
-  return(list(observed_accuracy = observed_accuracy, 
-              permuted_accuracies = permuted_accuracies, 
-              p_value = p_value))
-}
+# Data split
+set.seed(985)
+data_split <- initial_split(data = Wholebrain, prop = 0.8, strata = Diagnosis)
+training_data <- analysis(data_split)
+testing_data <- assessment(data_split)
 
-# 定义函数计算模型性能指标
-calculate_performance <- function(model, data, model_name = "") {
-  pred <- predict(model, newdata = data)
-  prob <- if (inherits(model, "randomForest")) {
-    predict(model, newdata = data, type = "prob")[,2]
-  } else {
-    predict(model, newdata = data, type = "prob")[,2]
-  }
-  positive_class <- levels(data$Diagnosis)[2]
-  cm <- confusionMatrix(pred, data$Diagnosis, positive = positive_class)
-  roc_obj <- tryCatch({
-    roc(response = data$Diagnosis, 
-        predictor = prob,
-        levels = levels(data$Diagnosis),
-        direction = "<",
-        quiet = TRUE)
-  }, error = function(e) {
-    message("ROC calculation error: ", e$message)
-    return(NULL)
-  })
-  auc_value <- if(!is.null(roc_obj)) auc(roc_obj) else NA
-  auc_ci <- if(!is.null(roc_obj)) {
-    ci.auc(roc_obj, method = "bootstrap", boot.n = 2000)  # 使用bootstrap方法
-  } else {
-    c(NA, NA, NA)
-  }
-  
-  return(list(
-    model_name = model_name,
-    accuracy = cm$overall["Accuracy"],
-    sensitivity = cm$byClass["Sensitivity"],
-    specificity = cm$byClass["Specificity"],
-    auc = auc_value,
-    auc_ci_lower = auc_ci[1],  
-    auc_ci_upper = auc_ci[3],  
-    confusion_matrix = cm,
-    roc_obj = roc_obj
-  ))
-}
+# parsnip
+rf_spec <- rand_forest(mtry = tune(),
+                       trees = tune(),
+                       min_n = tune()) |>
+  set_engine('ranger', importance = "permutation") |>
+  set_mode('classification')
 
-# 读取数据
-diff_brain_TD_PIGD <- read.csv("D:/PD/Imagings/SUVR/CentrumSemiovale_1/TD_PIGD/TD_PIGD_Wholebrain/MODELS/FinalFeature.csv")
-diff_brain_TD_PIGD <- diff_brain_TD_PIGD[, -c(1:4)] 
-diff_brain_TD_PIGD[,1] <- factor(diff_brain_TD_PIGD[,1], labels = c("Class0", "Class1"))
-names(diff_brain_TD_PIGD)[1] <- "Diagnosis" 
+# recipe
+recipe <- recipe(Diagnosis ~ ., data = training_data) |>
+  step_scale(all_numeric_predictors()) |>  
+  step_center(all_numeric_predictors())
 
-# 8：2划分训练集和测试集
-set.seed(400)
-trainid <- createDataPartition(y = diff_brain_TD_PIGD$Diagnosis, p = 0.80, list = FALSE)
-traindata <- diff_brain_TD_PIGD[trainid, ]
-testdata <- diff_brain_TD_PIGD[-trainid, ]
+# workflow
+rf <- workflow() |>
+  add_recipe(recipe) |>
+  add_model(rf_spec)
 
-# 数据标准化（排除分类变量）
-preProc <- preProcess(traindata[, -1], method = c("center", "scale"))
-traindata[, -1] <- predict(preProc, traindata[, -1])
-testdata[, -1] <- predict(preProc, testdata[, -1])
+rf_param <- rf |>
+  extract_parameter_set_dials() |>
+  update(mtry = mtry_prop(c(0.1, 1)))
 
-# 定义交叉验证控制参数（10折交叉验证）
-ctrl <- trainControl(method = "repeatedcv", 
-                     number = 10,
-                     repeats = 5,
-                     classProbs = TRUE,
-                     summaryFunction = twoClassSummary,
-                     savePredictions = TRUE)
+# Resamples
+resamples <- vfold_cv(data = training_data,
+                      v = 10,
+                      repeats = 5,
+                      strata = Diagnosis)
 
-# 1. 逻辑回归模型
-set.seed(400)
-logit_grid <- expand.grid(
-  alpha = seq(0, 1, by = 0.1), 
-  lambda = 10^seq(-4, 0, length.out = 20) 
-)
-logit_model <- train(
-  Diagnosis ~ .,
-  data = traindata,
-  method = "glmnet",
-  family = "binomial",
-  trControl = ctrl,
-  tuneGrid = logit_grid,
-  metric = "ROC"
+# Tune Parameters
+plan(multisession, workers = parallel::detectCores() - 1) 
+tune_rf <- tune_grid(rf,
+                     resamples = resamples,
+                     param_info = rf_param,
+                     grid = grid_space_filling(rf_param, size = 8),
+                     metrics = metric_set(roc_auc, f_meas),
+                     control = control_grid(verbose = TRUE,
+                                            allow_par = TRUE,
+                                            parallel_over = "everything",
+                                            event_level = "second"))
+
+# Optimal Parameters
+optim_rf_param <- tune_rf |> select_best(metric = 'roc_auc')
+
+# Fit Final Model
+final_rf <- finalize_workflow(rf, parameters = optim_rf_param)
+rf_fit <- fit(final_rf, data = training_data)
+
+# Prediction
+prediction_tra <- augment(rf_fit, new_data = training_data)
+prediction_tes <- augment(rf_fit, new_data = testing_data)
+
+# Calculate metrics
+wb_perf <- list(
+  tra = list(
+    accuracy = accuracy(data = prediction_tra, truth = Diagnosis, .pred_class, event_level = "second"),
+    auc = roc_auc(data = prediction_tra, truth = Diagnosis, .pred_Class1, event_level = "second"),
+    sensitivity = sens(data = prediction_tra, truth = Diagnosis, .pred_class, event_level = "second"),
+    specificity = spec(data = prediction_tra, truth = Diagnosis, .pred_class, event_level = "second"),
+    roc_obj = roc(response = as.numeric(prediction_tra$Diagnosis) - 1, 
+                  predictor = prediction_tra$.pred_Class1)
+  ),
+  tes = list(
+    accuracy = accuracy(data = prediction_tes, truth = Diagnosis, .pred_class, event_level = "second"),
+    auc = roc_auc(data = prediction_tes, truth = Diagnosis, .pred_Class1, event_level = "second"),
+    sensitivity = sens(data = prediction_tes, truth = Diagnosis, .pred_class, event_level = "second"),
+    specificity = spec(data = prediction_tes, truth = Diagnosis, .pred_class, event_level = "second"),
+    roc_obj = roc(response = as.numeric(prediction_tes$Diagnosis) - 1, 
+                  predictor = prediction_tes$.pred_Class1)
+  )
 )
 
-print(logit_model)
-best_grid_lg <- logit_model$bestTune
-cat("Best hyperparameters:\n")
-print(best_grid_lg)
+# ==================== NS Model ====================
+# Data preparation
+NS <- read.csv("D:/PD/LASSO/ns_FinalFeature.csv")
+NS <- NS[, -c(1:4)]
+NS[,1] <- factor(NS[,1], levels = c(0, 1), labels = c("Class0", "Class1"))
+names(NS)[1] <- "Diagnosis"
+str(NS)
+NS |> count(Diagnosis)
+miss_var_summary(NS)
 
-# 使用最优超参数重新训练最终模型
-final_model_lg <- train(
-  Diagnosis ~ .,
-  data = traindata,
-  method = "glmnet",
-  family = "binomial",
-  trControl = trainControl(method = "none", classProbs = TRUE),
-  tuneGrid = best_grid_lg,
-  metric = "ROC"
+# Data split
+set.seed(985)
+split_ns <- initial_split(data = NS, prop = 0.8, strata = Diagnosis)
+training_data_ns <- analysis(split_ns)
+testing_data_ns <- assessment(split_ns)
+
+# parsnip
+rf_ns <- rand_forest(mtry = tune(),
+                     trees = tune(),
+                     min_n = tune()) |>
+  set_engine('ranger', importance = "permutation") |>
+  set_mode('classification')
+
+# recipe
+recipe_ns <- recipe(Diagnosis ~ ., data = training_data_ns) |>
+  step_scale(all_numeric_predictors()) |>  
+  step_center(all_numeric_predictors())
+
+# workflow
+rf_ns <- workflow() |>
+  add_recipe(recipe_ns) |>
+  add_model(rf_ns)
+
+rf_param_ns <- rf_ns |>
+  extract_parameter_set_dials() |>
+  update(mtry = mtry_prop(c(0.1, 1)))
+
+# Resamples
+resamples <- vfold_cv(data = training_data_ns,
+                      v = 10,
+                      repeats = 5,
+                      strata = Diagnosis)
+
+# Tune Parameters
+plan(multisession, workers = parallel::detectCores() - 1) 
+tune_rf_ns <- tune_grid(rf_ns,
+                        resamples = resamples,
+                        param_info = rf_param_ns,
+                        grid = grid_space_filling(rf_param_ns, size = 8),
+                        metrics = metric_set(roc_auc, f_meas),
+                        control = control_grid(verbose = TRUE,
+                                               allow_par = TRUE,
+                                               parallel_over = "everything",
+                                               event_level = "second"))
+
+# Optimal Parameters
+optim_rf_param_ns <- tune_rf_ns |> select_best(metric = 'roc_auc')
+
+# Fit Final Model
+final_rf_ns <- finalize_workflow(rf_ns, parameters = optim_rf_param_ns)
+rf_fit_ns <- fit(final_rf_ns, data = training_data_ns)
+
+# Prediction
+ns_prediction_tra <- augment(rf_fit_ns, new_data = training_data_ns)
+ns_prediction_tes <- augment(rf_fit_ns, new_data = testing_data_ns)
+
+# Calculate metrics
+ns_perf <- list(
+  tra = list(
+    accuracy = accuracy(data = ns_prediction_tra, truth = Diagnosis, .pred_class, event_level = "second"),
+    auc = roc_auc(data = ns_prediction_tra, truth = Diagnosis, .pred_Class1, event_level = "second"),
+    sensitivity = sens(data = ns_prediction_tra, truth = Diagnosis, .pred_class, event_level = "second"),
+    specificity = spec(data = ns_prediction_tra, truth = Diagnosis, .pred_class, event_level = "second"),
+    roc_obj = roc(response = as.numeric(ns_prediction_tra$Diagnosis) - 1, 
+                  predictor = ns_prediction_tra$.pred_Class1)
+  ),
+   tes = list(
+    accuracy = accuracy(data = ns_prediction_tes, truth = Diagnosis, .pred_class, event_level = "second"),
+    auc = roc_auc(data = ns_prediction_tes, truth = Diagnosis, .pred_Class1, event_level = "second"),
+    sensitivity = sens(data = ns_prediction_tes, truth = Diagnosis, .pred_class, event_level = "second"),
+    specificity = spec(data = ns_prediction_tes, truth = Diagnosis, .pred_class, event_level = "second"),
+    roc_obj = roc(response = as.numeric(ns_prediction_tes$Diagnosis) - 1, 
+                  predictor = ns_prediction_tes$.pred_Class1)
+  )
 )
 
-# 评估模型
-train_perf_lg <- calculate_performance(final_model_lg, traindata, "LG (Train)")
-test_perf_lg <- calculate_performance(final_model_lg, testdata, "LG (Test)")
+# ==================== ONS Model====================
+# Data preparation
+ONS <- read.csv("D:/PD/LASSO/ons_FinalFeature.csv")
+ONS <- ONS[, -c(1:4)]
+ONS[,1] <- factor(ONS[,1], levels = c(0, 1), labels = c("Class0", "Class1"))
+names(ONS)[1] <- "Diagnosis"
+str(ONS)
+ONS |> count(Diagnosis)
+miss_var_summary(ONS)
 
-# 2. SVM模型
-set.seed(400)
-svm_grid <- expand.grid(sigma = 2^seq(-5, 1, by = 1),
-                        C = 2^seq(-3, 3, by = 1))
-svm_model <- train(Diagnosis ~ .,
-                   data = traindata,
-                   method = "svmRadial",
-                   trControl = ctrl,
-                   tuneGrid = svm_grid,
-                   metric = "ROC")
+# Data split
+set.seed(985)
+split_ons <- initial_split(data = ONS, prop = 0.8, strata = Diagnosis)
+training_data_ons <- analysis(split_ons)
+testing_data_ons <- assessment(split_ons)
 
-print(svm_model)
-best_svm_grid <- svm_model$bestTune
-cat("Best hyperparameters:\n")
-print(best_svm_grid)
+# parsnip
+rf_ons <- rand_forest(mtry = tune(),
+                      trees = tune(),
+                      min_n = tune()) |>
+  set_engine('ranger', importance = "permutation") |>
+  set_mode('classification')
 
-# 使用最优超参数重新训练最终模型
-final_model_svm <- train(
-  Diagnosis ~ .,
-  data = traindata,
-  method = "svmRadial",
-  trControl = trainControl(method = "none", classProbs = TRUE), 
-  tuneGrid = best_svm_grid,
-  metric = "ROC"
+# recipe
+recipe_ons <- recipe(Diagnosis ~ ., data = training_data_ons) |>
+  step_scale(all_numeric_predictors()) |>  
+  step_center(all_numeric_predictors())
+
+# workflow
+rf_ons <- workflow() |>
+  add_recipe(recipe_ons) |>
+  add_model(rf_ons)
+
+rf_param_ons <- rf_ons |>
+  extract_parameter_set_dials() |>
+  update(mtry = mtry_prop(c(0.1, 1)))
+
+# Resamples
+resamples <- vfold_cv(data = training_data_ons,
+                      v = 10,
+                      repeats = 5,
+                      strata = Diagnosis)
+
+# Tune Parameters
+tune_rf_ons <- tune_grid(rf_ons,
+                         resamples = resamples,
+                         param_info = rf_param_ons,
+                         grid = grid_space_filling(rf_param_ons, size = 8),
+                         metrics = metric_set(roc_auc, f_meas),
+                         control = control_grid(verbose = TRUE,
+                                                allow_par = TRUE,
+                                                parallel_over = "everything",
+                                                event_level = "second"))
+
+# Optimal Parameters
+optim_rf_param_ons <- tune_rf_ons |> select_best(metric = 'roc_auc')
+
+# Fit Final Model
+final_rf_ons <- finalize_workflow(rf_ons, parameters = optim_rf_param_ons)
+rf_fit_ons <- fit(final_rf_ons, data = training_data_ons)
+
+# Prediction
+ons_prediction_tra <- augment(rf_fit_ons, new_data = training_data_ons)
+ons_prediction_tes <- augment(rf_fit_ons, new_data = testing_data_ons)
+
+# Calculate metrics
+ons_perf <- list(
+  tra = list(
+    accuracy = accuracy(data = ons_prediction_tra, truth = Diagnosis, .pred_class, event_level = "second"),
+    auc = roc_auc(data = ons_prediction_tra, truth = Diagnosis, .pred_Class1, event_level = "second"),
+    sensitivity = sens(data = ons_prediction_tra, truth = Diagnosis, .pred_class, event_level = "second"),
+    specificity = spec(data = ons_prediction_tra, truth = Diagnosis, .pred_class, event_level = "second"),
+    roc_obj = roc(response = as.numeric(ons_prediction_tra$Diagnosis) - 1, 
+                  predictor = ons_prediction_tra$.pred_Class1)
+  ),
+  tes = list(
+    accuracy = accuracy(data = ons_prediction_tes, truth = Diagnosis, .pred_class, event_level = "second"),
+    auc = roc_auc(data = ons_prediction_tes, truth = Diagnosis, .pred_Class1, event_level = "second"),
+    sensitivity = sens(data = ons_prediction_tes, truth = Diagnosis, .pred_class, event_level = "second"),
+    specificity = spec(data = ons_prediction_tes, truth = Diagnosis, .pred_class, event_level = "second"),
+    roc_obj = roc(response = as.numeric(ons_prediction_tes$Diagnosis) - 1, 
+                  predictor = ons_prediction_tes$.pred_Class1)
+  )
 )
 
-# 评估模型
-train_perf_svm <- calculate_performance(final_model_svm, traindata, "SVM (Train)")
-test_perf_svm <- calculate_performance(final_model_svm, testdata, "SVM (Test)")
-
-# 3. 随机森林模型
-set.seed(400)
-rf_grid <- expand.grid(mtry = seq(2, sqrt(ncol(traindata)-1), length.out = 3))
-rf_model <- train(Diagnosis ~ .,
-                  data = traindata,
-                  method = "rf",
-                  trControl = ctrl,
-                  tuneGrid = rf_grid,
-                  importance = TRUE,
-                  metric = "ROC")
-
-print(rf_model)
-best_mtry_rf <- rf_model$bestTune$mtry
-cat("最佳 mtry 参数:", best_mtry_rf, "\n")
-
-# 使用最优超参数重新训练最终模型
-final_model_rf <- randomForest(Diagnosis ~ .,
-                               data = traindata,
-                               mtry = best_mtry_rf,
-                               importance = TRUE)
-
-# 评估模型
-train_perf_rf <- calculate_performance(final_model_rf, traindata, "RF (Train)")
-test_perf_rf <- calculate_performance(final_model_rf, testdata, "RF (Test)")
-
-# 对每个模型-测试数据对运行置换检验
-model_test_pairs <- list(
-  LG = list(model = final_model_lg, test_data = testdata),
-  SVM = list(model = final_model_svm, test_data = testdata),
-  RF = list(model = final_model_rf, test_data = testdata))
-
-set.seed(123)
-permutation_results <- purrr::map(model_test_pairs, ~ {
-  permutation_test(.x$model, .x$test_data, n_permutations = 1000)
-})
-
-# 汇总模型性能结果
-performance_results <- list(
-  train_perf_lg, test_perf_lg,
-  train_perf_svm, test_perf_svm,
-  train_perf_rf, test_perf_rf
+# ==================== Results summary and visualization ====================
+# Plot ROC curve
+train_roc_data <- list(
+  NS = ns_perf$tra$roc_obj,
+  ONS = ons_perf$tra$roc_obj,
+  WB = wb_perf$tra$roc_obj
 )
 
-# 创建结果数据框
-results_df <- data.frame(
-  Model = sapply(performance_results, function(x) x$model_name),
-  Accuracy = sapply(performance_results, function(x) x$accuracy),
-  Sensitivity = sapply(performance_results, function(x) x$sensitivity),
-  Specificity = sapply(performance_results, function(x) x$specificity),
-  AUC = sapply(performance_results, function(x) x$auc),
-  AUC_CI_Lower = sapply(performance_results, function(x) x$auc_ci_lower),  
-  AUC_CI_Upper = sapply(performance_results, function(x) x$auc_ci_upper),
-  stringsAsFactors = FALSE
+test_roc_data <- list(
+  NS = ns_perf$tes$roc_obj,
+  ONS = ons_perf$tes$roc_obj,
+  WB = wb_perf$tes$roc_obj
 )
 
-# 添加置换检验的p值
-results_df$Permutation_p_value <- NA
-results_df$Permutation_p_value[results_df$Model == "LG (Test)"] <- permutation_results$LG$p_value
-results_df$Permutation_p_value[results_df$Model == "SVM (Test)"] <- permutation_results$SVM$p_value
-results_df$Permutation_p_value[results_df$Model == "RF (Test)"] <- permutation_results$RF$p_value
-
-# 打印结果
-print("模型性能汇总:")
-print(results_df)
-
-# 打印混淆矩阵
-cat("\n=== Confusion Matrices ===\n")
-cat("\nLG model (Train):\n")
-print(train_perf_lg$confusion_matrix)
-cat("\nLG model (Test):\n")
-print(test_perf_lg$confusion_matrix)
-cat("\nSVM model (Train):\n")
-print(train_perf_svm$confusion_matrix)
-cat("\nSVM model (Test):\n")
-print(test_perf_svm$confusion_matrix)
-cat("\nRF model (Train):\n")
-print(train_perf_rf$confusion_matrix)
-cat("\nRF model (Test):\n")
-print(test_perf_rf$confusion_matrix)
-
-# 自定义主题
 custom_theme <- theme(
   panel.background = element_blank(),
   panel.border = element_rect(fill = NA, color = "black"),
@@ -244,31 +284,22 @@ custom_theme <- theme(
   legend.justification = c(1, 0),    # 对齐基准点
   legend.background = element_rect(fill = "white", color = "black"),
   legend.title = element_blank(),
-  legend.text = element_text(size = 11, face = "bold"),  # 加粗图例文字
+  legend.text = element_text(size = 11, face = "bold"),  
   axis.text = element_text(size = 10),
   axis.title = element_text(size = 12),
   plot.title = element_text(size = 14, face = "bold", hjust = 0.5)
 )
 
-# 准备训练集ROC数据
-train_roc_data <- list(
-  "Logistic Regression" = train_perf_lg$roc_obj,
-  "SVM" = train_perf_svm$roc_obj,
-  "Random Forest" = train_perf_rf$roc_obj
-)
-
-# 准备测试集ROC数据
-test_roc_data <- list(
-  "Logistic Regression" = test_perf_lg$roc_obj,
-  "SVM" = test_perf_svm$roc_obj,
-  "Random Forest" = test_perf_rf$roc_obj
-)
-
-# 绘制训练组ROC曲线
 train_legend_labels <- c(
-  paste0("LG AUC = ", round(auc(train_perf_lg$roc_obj), 3)),
-  paste0("SVM AUC = ", round(auc(train_perf_svm$roc_obj), 3)), 
-  paste0("RF AUC = ", round(auc(train_perf_rf$roc_obj), 3))
+  paste0("NS AUC = ", round(auc(ns_perf$tra$roc_obj), 3), 
+         " (", round(ci.auc(ns_perf$tra$roc_obj)[1], 3), "-", 
+         round(ci.auc(ns_perf$tra$roc_obj)[3], 3), ")"),
+  paste0("ONS AUC = ", round(auc(ons_perf$tra$roc_obj), 3), 
+         " (", round(ci.auc(ons_perf$tra$roc_obj)[1], 3), "-", 
+         round(ci.auc(ons_perf$tra$roc_obj)[3], 3), ")"),
+  paste0("WB AUC = ", round(auc(wb_perf$tra$roc_obj), 3), 
+         " (", round(ci.auc(wb_perf$tra$roc_obj)[1], 3), "-", 
+         round(ci.auc(wb_perf$tra$roc_obj)[3], 3), ")")
 )
 
 train_roc_plot <- ggroc(train_roc_data, legacy.axes = TRUE, size = 1) +
@@ -284,11 +315,16 @@ train_roc_plot <- ggroc(train_roc_data, legacy.axes = TRUE, size = 1) +
   custom_theme +
   guides(color = guide_legend(override.aes = list(size = 2)))
 
-# 绘制测试组ROC曲线
 test_legend_labels <- c(
-  paste0("LG AUC = ", round(auc(test_perf_lg$roc_obj), 3)), 
-  paste0("SVM AUC = ", round(auc(test_perf_svm$roc_obj), 3)),
-  paste0("RF AUC = ", round(auc(test_perf_rf$roc_obj), 3))
+  paste0("NS AUC = ", round(auc(ns_perf$tes$roc_obj), 3), 
+         " (", round(ci.auc(ns_perf$tes$roc_obj)[1], 3), "-", 
+         round(ci.auc(ns_perf$tes$roc_obj)[3], 3), ")"),
+  paste0("ONS AUC = ", round(auc(ons_perf$tes$roc_obj), 3), 
+         " (", round(ci.auc(ons_perf$tes$roc_obj)[1], 3), "-", 
+         round(ci.auc(ons_perf$tes$roc_obj)[3], 3), ")"),
+  paste0("WB AUC = ", round(auc(wb_perf$tes$roc_obj), 3), 
+         " (", round(ci.auc(wb_perf$tes$roc_obj)[1], 3), "-", 
+         round(ci.auc(wb_perf$tes$roc_obj)[3], 3), ")")
 )
 
 test_roc_plot <- ggroc(test_roc_data, legacy.axes = TRUE, size = 1.5) +
@@ -302,12 +338,140 @@ test_roc_plot <- ggroc(test_roc_data, legacy.axes = TRUE, size = 1.5) +
   custom_theme +
   guides(color = guide_legend(override.aes = list(size = 2)))
 
-# 显示图形
 print(train_roc_plot)
 print(test_roc_plot)
 
-# 保存图形
-ggsave("D:/PD/Imagings/SUVR/CentrumSemiovale_1/TD_PIGD/TD_PIGD_Wholebrain/MODELS/ROC_Train_LGRFSVM.png", 
+ggsave("D:/PD/MODELS/ROC_Train.png", 
        train_roc_plot, width = 6, height = 6, dpi = 300)
-ggsave("D:/PD/Imagings/SUVR/CentrumSemiovale_1/TD_PIGD/TD_PIGD_Wholebrain/MODELS/ROC_Test_LGRF_SVM.png", 
+ggsave("D:/PD/MODELS/ROC_Test.png", 
        test_roc_plot, width = 6, height = 6, dpi = 300)
+
+# Summary metrics
+performance_summary <- data.frame(
+  Model = rep(c("WB", "NS", "ONS"), each = 2),
+  Dataset = rep(c("Training", "Test"), times = 3),
+  AUC = c(
+    wb_perf$tra$auc$.estimate, wb_perf$tes$auc$.estimate,
+    ns_perf$tra$auc$.estimate, ns_perf$tes$auc$.estimate,
+    ons_perf$tra$auc$.estimate, ons_perf$tes$auc$.estimate
+  ),
+  AUC_CI = c(
+    paste0(round(ci.auc(wb_perf$tra$roc_obj)[1], 3), "-", round(ci.auc(wb_perf$tra$roc_obj)[3], 3)),
+    paste0(round(ci.auc(wb_perf$tes$roc_obj)[1], 3), "-", round(ci.auc(wb_perf$tes$roc_obj)[3], 3)),
+    paste0(round(ci.auc(ns_perf$tra$roc_obj)[1], 3), "-", round(ci.auc(ns_perf$tra$roc_obj)[3], 3)),
+    paste0(round(ci.auc(ns_perf$tes$roc_obj)[1], 3), "-", round(ci.auc(ns_perf$tes$roc_obj)[3], 3)),
+    paste0(round(ci.auc(ons_perf$tra$roc_obj)[1], 3), "-", round(ci.auc(ons_perf$tra$roc_obj)[3], 3)),
+    paste0(round(ci.auc(ons_perf$tes$roc_obj)[1], 3), "-", round(ci.auc(ons_perf$tes$roc_obj)[3], 3))
+  ),
+  Sensitivity = c(
+    wb_perf$tra$sensitivity$.estimate, wb_perf$tes$sensitivity$.estimate,
+    ns_perf$tra$sensitivity$.estimate, ns_perf$tes$sensitivity$.estimate,
+    ons_perf$tra$sensitivity$.estimate, ons_perf$tes$sensitivity$.estimate
+  ),
+  Specificity = c(
+    wb_perf$tra$specificity$.estimate, wb_perf$tes$specificity$.estimate,
+    ns_perf$tra$specificity$.estimate, ns_perf$tes$specificity$.estimate,
+    ons_perf$tra$specificity$.estimate, ons_perf$tes$specificity$.estimate
+  )
+)
+
+# ==================== Permutation test ====================
+set.seed(1)
+perm_test_auc <- function(data, model, n_perm = 1000) {
+  actual_auc <- roc_auc(data, truth = Diagnosis, .pred_Class1, event_level = "second")$.estimate
+  perm_aucs <- numeric(n_perm)
+  
+  for (i in 1:n_perm) {
+    perm_data <- data %>%
+      mutate(perm_Diagnosis = sample(Diagnosis))
+
+    perm_auc <- roc_auc(perm_data, truth = perm_Diagnosis, .pred_Class1, event_level = "second")$.estimate
+    perm_aucs[i] <- perm_auc
+  }
+  
+  p_value <- mean(perm_aucs >= actual_auc)
+  p_value_display <- ifelse(p_value < 0.001, "<0.001", round(p_value, 3))
+  
+  return(list(actual_auc = actual_auc, perm_aucs = perm_aucs, p_value = p_value, p_value_display = p_value_display))
+}
+
+wb_perm_test_tes <- perm_test_auc(prediction_tes, rf_fit)
+ns_perm_test_tes <- perm_test_auc(ns_prediction_tes, rf_fit_ns)
+ons_perm_test_tes <- perm_test_auc(ons_prediction_tes, rf_fit_ons)
+
+performance_summary <- performance_summary %>%
+  mutate(
+    AUC_Perm_PValue = c(
+      NA, wb_perm_test_tes$p_value_display,
+      NA, ns_perm_test_tes$p_value_display,
+      NA, ons_perm_test_tes$p_value_display
+    )
+  )
+
+print("Performance Summary with Permutation Test Results:")
+print(performance_summary)
+
+# Confusion matrix
+wb_conf_mat_tra <- conf_mat(data=prediction_tra, truth = Diagnosis, .pred_class)
+wb_conf_mat_tes <- conf_mat(data=prediction_tes, truth = Diagnosis, .pred_class)
+ns_wb_conf_mat_tra <- conf_mat(data=ns_prediction_tra, truth = Diagnosis, .pred_class)
+ns_wb_conf_mat_tes <- conf_mat(data=ns_prediction_tes, truth = Diagnosis, .pred_class)
+ons_wb_conf_mat_tra <- conf_mat(data=ons_prediction_tra, truth = Diagnosis, .pred_class)
+ons_wb_conf_mat_tes <- conf_mat(data=ons_prediction_tes, truth = Diagnosis, .pred_class)
+wb_conf_mat_tra
+wb_conf_mat_tes
+ns_wb_conf_mat_tra
+ns_wb_conf_mat_tes
+ons_wb_conf_mat_tra
+ons_wb_conf_mat_tes
+
+# ==================== Feature Importance ====================
+get_imp_data <- function(model_fit, top_n = 20) {
+  model_fit |> 
+    extract_fit_parsnip() |> 
+    vi() |> 
+    arrange(desc(Importance)) |> 
+    head(top_n)
+}
+
+imp_data_wb <- get_imp_data(rf_fit)
+imp_data_ns <- get_imp_data(rf_fit_ns)
+imp_data_ons <- get_imp_data(rf_fit_ons)
+
+create_imp_plot <- function(imp_data, title, color = "steelblue") {
+  ggplot(imp_data, aes(x = reorder(Variable, Importance), y = Importance)) +
+    geom_col(fill = color, width = 0.6, alpha = 0.8) +
+    labs(title = title, x = "", y = "Importance") +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+      panel.grid.major.y = element_blank(),
+      panel.grid.minor.y = element_blank(),
+      axis.text.y = element_text(color = "black", size = 10),
+      axis.text.x = element_text(color = "black", size = 10),
+      axis.title.x = element_text(size = 12, margin = margin(t = 10))
+    ) +
+    coord_flip()
+}
+
+wb_imp_plot <- create_imp_plot(imp_data_wb, 
+                               "Feature Importance",
+                               color = "#377EB8") 
+
+ns_imp_plot <- create_imp_plot(imp_data_ns,
+                               "Feature Importance",
+                               color = "#377EB8")  
+
+ons_imp_plot <- create_imp_plot(imp_data_ons,
+                                "Feature Importance",
+                                color = "#377EB8")  
+print(wb_imp_plot)
+print(ns_imp_plot)
+print(ons_imp_plot)
+
+ggsave("D:/PD/MODELS/Feature_Importance_WB.png", 
+       wb_imp_plot, width = 6, height = 8, dpi = 300)
+ggsave("D:/PD/MODELS/Feature_Importance_ONS.png", 
+       wb_imp_plot, width = 6, height = 8, dpi = 300)
+ggsave("D:/PD/MODELS/Feature_Importance_NS.png", 
+       wb_imp_plot, width = 6, height = 8, dpi = 300)
