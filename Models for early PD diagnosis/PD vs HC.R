@@ -1,147 +1,143 @@
-# 清除环境变量
-rm(list = ls())
+library(tidymodels)
+library(naniar)
+library(future)
+library(pROC)
+library(ggplot2)
+library(patchwork)
+library(kernlab)
 
-# 安装并加载所需包
-if (!require("pacman")) install.packages("pacman")
-pacman::p_load(caret, pROC, randomForest, e1071, ggplot2, dplyr, purrr, doParallel, knitr, kernlab, tidyverse)
+### Data preparation
+PD <- read.csv("D:/PD/Imagings/SUVR/CentrumSemiovale_1/HC_PD/HC_PD_Wholebrain/MODELS/FinalFeature.csv")
+PD <- PD[, -c(1:4)] 
+PD[,1] <- factor(PD[,1], levels = c(1, 0), labels = c("Class1", "Class0"))
+names(PD)[1] <- "Diagnosis"
+str(PD)
+PD |> count(Diagnosis)
+miss_var_summary(PD)
 
-# 启用并行计算
-cl <- makePSOCKcluster(detectCores() - 1)
-registerDoParallel(cl)
-clusterEvalQ(cl, {
-  library(pROC)
-  library(caret)
-  library(randomForest)
-  library(e1071)
-  library(purrr) 
-})
+set.seed(401)
+resamples <- vfold_cv(data = PD,
+                      v = 10,
+                      repeats = 10,
+                      strata = Diagnosis)
+metrics <- metric_set(accuracy, sens, spec, f_meas)
 
-# 读取数据
-data <- read.csv("D:/PD/Imagings/SUVR/CentrumSemiovale_1/HC_PD/HC_PD_Wholebrain/MODELS/FinalFeature.csv") %>% 
-  select(-(1:4)) %>% 
-  mutate(Diagnosis = factor(.[,1], levels = c(0, 1), labels = c("HC", "PD"))) %>% 
-  rename(Diagnosis = 1)
+# ==================== Logistic Regression(LR) ====================
+# parsnip
+lr_spec <- logistic_reg() |>
+  set_engine("glm") |>
+  set_mode("classification")
 
-# 设置随机种子
-set.seed(863)
+# Recipe
+recipe_lr <- recipe(Diagnosis ~ ., data = PD) |>
+  step_scale(all_numeric_predictors()) |>  
+  step_center(all_numeric_predictors())
 
-# 定义交叉验证参数
-ctrl <- trainControl(
-  method = "repeatedcv",
-  number = 10,
-  repeats = 5,
-  classProbs = TRUE,
-  summaryFunction = twoClassSummary,
-  savePredictions = "final",
-  allowParallel = TRUE
+# workflow
+lr_wf <- workflow() |>
+  add_recipe(recipe_lr) |>
+  add_model(lr_spec)
+
+# cross—validation
+lr_final <- lr_wf|>
+  fit_resamples(resamples,metrics=metrics)
+
+# ==================== Support Vector Machine (SVM) ====================
+# parsnip
+svm_spec <- svm_poly(degree = 1) |>
+  set_mode("classification") |>
+  set_engine("kernlab", scaled = FALSE) |>
+  set_args(cost = tune())
+
+# Recipe
+recipe_svm <- recipe(Diagnosis ~ ., data = PD) |>
+  step_scale(all_numeric_predictors()) |>  
+  step_center(all_numeric_predictors())
+
+# workflow
+svm_wf <- workflow() |>
+  add_recipe(recipe_svm) |>
+  add_model(svm_spec)
+
+# Tune Parameters
+param_grid <- grid_regular(cost(), levels = 10)
+
+plan(multisession, workers = parallel::detectCores() - 1) 
+tune_svm <- tune_grid(
+  svm_wf,
+  resamples = resamples,
+  grid = param_grid,
+  metrics = metrics,
+  control = control_grid(verbose = TRUE,
+                         allow_par = TRUE,
+                         parallel_over = "everything",
+                         event_level = "first")
 )
 
-# 训练三种分类器
-train_models <- function(data, ctrl) {
-  list(
-    logistic = train(Diagnosis ~ ., data = data, 
-                     method = "glm", family = "binomial",
-                     trControl = ctrl, metric = "ROC"),
-    
-    svm = train(Diagnosis ~ ., data = data,
-                method = "svmRadial",
-                trControl = ctrl, tuneLength = 10,
-                metric = "ROC"),
-    
-    rf = train(Diagnosis ~ ., data = data,
-               method = "rf",
-               trControl = ctrl, tuneLength = 10,
-               importance = TRUE, metric = "ROC")
-  )
-}
+# Optimal Parameters
+best_cost <- tune_svm |> select_best(metric = 'accuracy')
 
-# 训练模型
-models <- train_models(data, ctrl)
+# Fit Final Model
+svm_fit <- finalize_workflow(svm_wf, best_cost)|>
+  fit(PD)
 
-# 性能指标计算
-calculate_metrics <- function(model) {
-  if (is.null(model$pred)) return(NULL)
-  
-  fold_stats <- model$pred %>%
-    group_by(Resample) %>%
-    summarise(
-      Accuracy = mean(obs == pred, na.rm = TRUE),
-      Sensitivity = sum(obs == "PD" & pred == "PD", na.rm = TRUE) / 
-        sum(obs == "PD", na.rm = TRUE),
-      Specificity = sum(obs == "HC" & pred == "HC", na.rm = TRUE) / 
-        sum(obs == "HC", na.rm = TRUE),
-      AUC = as.numeric(pROC::auc(pROC::roc(obs, PD, quiet = TRUE))),
-      .groups = "drop"
-    )
-  
-  # 计算均值和标准差
-  data.frame(
-    Accuracy_mean = round(mean(fold_stats$Accuracy, na.rm = TRUE), 3),
-    Accuracy_sd = round(sd(fold_stats$Accuracy, na.rm = TRUE), 3),
-    Sensitivity_mean = round(mean(fold_stats$Sensitivity, na.rm = TRUE), 3),
-    Sensitivity_sd = round(sd(fold_stats$Sensitivity, na.rm = TRUE), 3),
-    Specificity_mean = round(mean(fold_stats$Specificity, na.rm = TRUE), 3),
-    Specificity_sd = round(sd(fold_stats$Specificity, na.rm = TRUE), 3),
-    AUC_mean = round(mean(fold_stats$AUC, na.rm = TRUE), 3),
-    AUC_sd = round(sd(fold_stats$AUC, na.rm = TRUE), 3)
-  )
-}
+# cross—validation
+svm_final <- svm_wf %>%
+  finalize_workflow(best_cost) %>%
+  fit_resamples(resamples, metrics = metrics)
 
-metrics_list <- purrr::map(models, safely(calculate_metrics))
+# ==================== Random Forest (RF) ====================
+# parsnip
+rf_spec <- rand_forest(mtry = tune(),
+                       trees = tune(),
+                       min_n = tune()) |>
+  set_engine('ranger') |>
+  set_mode('classification')
 
-# 提取有效结果
-metrics_list <- map(metrics_list, ~ .x$result) %>% 
-  compact()
+# recipe
+recipe_rf <- recipe(Diagnosis ~ ., data = PD) |>
+  step_scale(all_numeric_predictors()) |>  
+  step_center(all_numeric_predictors())
 
-# 置换检验函数
-permutation_test <- function(model, data, n_perm = 1000) {
-  obs_prob <- predict(model, data, type = "prob")[, "PD"]
-  obs_auc <- pROC::roc(data$Diagnosis, obs_prob)$auc
-  
-  perm_aucs <- foreach(i = 1:n_perm, .combine = 'c',
-                       .packages = c("pROC", "caret")) %dopar% {
-                         perm_data <- data
-                         perm_data$Diagnosis <- sample(perm_data$Diagnosis)
-                         perm_prob <- predict(model, perm_data, type = "prob")[, "PD"]
-                         pROC::roc(perm_data$Diagnosis, perm_prob)$auc
-                       }
-  
-  (sum(perm_aucs >= obs_auc) + 1) / (n_perm + 1)
-}
+# workflow
+rf_wf <- workflow() |>
+  add_recipe(recipe_rf) |>
+  add_model(rf_spec)
 
-# 执行置换检验
-perm_results <- map(models, ~{
-  tryCatch(
-    permutation_test(.x, data, 1000),
-    error = function(e) {
-      message("置换检验失败: ", conditionMessage(e))
-      NA
-    }
-  )
-})
+rf_param <- rf_wf |>
+  extract_parameter_set_dials() |>
+  update(mtry = mtry_prop(c(0.1, 1)))
 
-# 创建结果表
-results_table <- map2_dfr(names(metrics_list), metrics_list, function(name, metrics) {
-  data.frame(
-    Model = case_when(
-      name == "logistic" ~ "Logistic Regression",
-      name == "svm" ~ "SVM (RBF Kernel)", 
-      name == "rf" ~ "Random Forest"
-    ),
-    Accuracy = sprintf("%.3f ± %.3f", metrics$Accuracy_mean, metrics$Accuracy_sd),
-    Sensitivity = sprintf("%.3f ± %.3f", metrics$Sensitivity_mean, metrics$Sensitivity_sd),
-    Specificity = sprintf("%.3f ± %.3f", metrics$Specificity_mean, metrics$Specificity_sd),
-    AUC = sprintf("%.3f ± %.3f", metrics$AUC_mean, metrics$AUC_sd),
-    `Permutation p` = ifelse(is.na(perm_results[[name]]), "Failed",
-                             ifelse(perm_results[[name]] < 0.001, "<0.001",
-                                    sprintf("%.3f", perm_results[[name]]))),
-    stringsAsFactors = FALSE
-  )
-})
+# Tune Parameters
+tune_rf <- tune_grid(rf_wf,
+                     resamples = resamples,
+                     param_info = rf_param,
+                     grid = grid_space_filling(rf_param, size = 10),
+                     metrics = metrics,
+                     control = control_grid(verbose = TRUE,
+                                            allow_par = TRUE,
+                                            parallel_over = "everything",
+                                            event_level = "first"))
 
-# 打印结果
-cat("\n=== 三分类器性能比较 (10×5 CV) ===\n")
-print(knitr::kable(results_table, align = c('l', rep('c', 5))))
+# Optimal Parameters
+optim_rf_param <- tune_rf |> select_best(metric = "accuracy")
 
-# 停止并行
-stopCluster(cl)
+# Fit Final Model
+rf_fit <-finalize_workflow(rf_wf, optim_rf_param) %>%
+  fit(PD)
+
+# Cross-Validation
+rf_final <- rf_wf %>%
+  finalize_workflow(optim_rf_param) %>%
+  fit_resamples(resamples, metrics = metrics) 
+
+# Extract Final Results
+cat("\n=== LG Model (Final CV Results) ===\n")
+final_metrics_lr <- collect_metrics(lr_final)
+print(final_metrics_lr)
+cat("\n=== SVM Model (Final CV Results) ===\n")
+final_metrics_svm <- collect_metrics(svm_final)
+print(final_metrics_svm)
+cat("=== RF Model (Final CV Results) ===\n")
+final_metrics_rf <- collect_metrics(rf_final)
+print(final_metrics_rf)
