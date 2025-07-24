@@ -1,0 +1,240 @@
+library(tidymodels)
+library(dplyr) 
+library(glmnet)
+
+# ==================== Early PD vs HC ====================
+PD <- read.csv("D:/PD/early_HC_PD_difbrain_wb_afterCOR.csv")
+PD  <- PD [, -c(1:4)] 
+PD[,1] <- factor(PD[,1], levels = c(0, 1), labels = c("Class0", "Class1"))
+names(PD)[1] <- "Diagnosis"
+
+lasso_recipe <- 
+  recipe(Diagnosis ~ ., data = PD) %>% 
+  step_novel(all_nominal_predictors()) %>% 
+  step_dummy(all_nominal_predictors()) %>% 
+  step_zv(all_predictors()) %>% 
+  step_normalize(all_predictors())
+
+lasso_spec <- 
+  logistic_reg(penalty = tune(), mixture = 1) %>% 
+  set_engine("glmnet") 
+
+lasso_workflow <- workflow() %>% 
+  add_recipe(lasso_recipe) %>% 
+  add_model(lasso_spec)
+
+set.seed(123)
+PD_fold <- vfold_cv(PD, v = 10, strata = Diagnosis)
+penalty_grid <- tibble(penalty = 10^seq(-4, 0, length.out = 20))
+tune_res <- tune_grid(
+  lasso_workflow,
+  resamples = PD_fold, 
+  grid = penalty_grid
+)
+
+best_penalty <- select_best(tune_res, metric = "roc_auc")
+
+lasso_final <- finalize_workflow(lasso_workflow, best_penalty)|>
+  fit(data = PD)
+
+tidy(lasso_final) %>% 
+  filter(estimate != 0)
+
+
+#==================== Early TD vs HC ====================
+rm(list = ls())
+TD <- read.csv("D:/PD/early_HC_TD_difbrain_afterCOR.csv")
+TD  <- TD [, -c(1:5)] 
+TD[,1] <- factor(TD[,1], levels = c(0, 1), labels = c("Class0", "Class1"))
+names(TD)[1] <- "Diagnosis"
+
+lasso_recipe <- 
+  recipe(Diagnosis ~ ., data = TD) %>% 
+  step_novel(all_nominal_predictors()) %>% 
+  step_dummy(all_nominal_predictors()) %>% 
+  step_zv(all_predictors()) %>% 
+  step_normalize(all_predictors())
+
+lasso_spec <- 
+  logistic_reg(penalty = tune(), mixture = 1) %>% 
+  set_engine("glmnet") 
+
+lasso_workflow <- workflow() %>% 
+  add_recipe(lasso_recipe) %>% 
+  add_model(lasso_spec)
+
+set.seed(123)
+TD_fold <- vfold_cv(TD, v = 10, strata = Diagnosis)
+penalty_grid <- tibble(penalty = 10^seq(-4, 0, length.out = 20))
+tune_res <- tune_grid(
+  lasso_workflow,
+  resamples = TD_fold, 
+  grid = penalty_grid
+)
+
+best_penalty <- select_best(tune_res, metric = "roc_auc")
+
+lasso_final <- finalize_workflow(lasso_workflow, best_penalty)|>
+  fit(data = TD)
+
+tidy(lasso_final) %>% 
+  filter(estimate != 0)
+
+#==================== Early PIGD vs HC ====================
+rm(list = ls())
+PIGD <- read.csv("D:/PD/early_HC_PIGD_difbrain_afterCOR.csv")
+PIGD  <- PIGD [, -c(1:4)] 
+PIGD[,1] <- factor(PIGD[,1], levels = c(0, 1), labels = c("Class0", "Class1"))
+names(PIGD)[1] <- "Diagnosis"
+
+lasso_recipe <- 
+  recipe(Diagnosis ~ ., data = PIGD) %>% 
+  step_novel(all_nominal_predictors()) %>% 
+  step_dummy(all_nominal_predictors()) %>% 
+  step_zv(all_predictors()) %>% 
+  step_normalize(all_predictors())
+
+lasso_spec <- 
+  logistic_reg(penalty = tune(), mixture = 1) %>% 
+  set_engine("glmnet") 
+
+lasso_workflow <- workflow() %>% 
+  add_recipe(lasso_recipe) %>% 
+  add_model(lasso_spec)
+
+set.seed(123)
+PIGD_fold <- vfold_cv(PIGD, v = 10, strata = Diagnosis)
+penalty_grid <- tibble(penalty = 10^seq(-4, 0, length.out = 20))
+tune_res <- tune_grid(
+  lasso_workflow,
+  resamples = PIGD_fold, 
+  grid = penalty_grid
+)
+
+best_penalty <- select_best(tune_res, metric = "roc_auc")
+
+lasso_final <- finalize_workflow(lasso_workflow, best_penalty)|>
+  fit(data = PIGD)
+
+tidy(lasso_final) %>% 
+  filter(estimate != 0)
+
+#==================== Early TD vs PIGD ====================
+#### WB Model
+rm(list = ls())
+WB <- read.csv("D:/PD/difbrain_after_correlation.csv")
+WB  <- WB [, -c(1:4)] 
+WB[,1] <- factor(WB[,1], levels = c(0, 1), labels = c("Class0", "Class1"))
+names(WB)[1] <- "Diagnosis"
+
+lasso_recipe <- 
+  recipe(Diagnosis ~ ., data = WB) %>% 
+  step_novel(all_nominal_predictors()) %>% 
+  step_dummy(all_nominal_predictors()) %>% 
+  step_zv(all_predictors()) %>% 
+  step_normalize(all_predictors())
+
+lasso_spec <- 
+  logistic_reg(penalty = tune(), mixture = 1) %>% 
+  set_engine("glmnet") 
+
+lasso_workflow <- workflow() %>% 
+  add_recipe(lasso_recipe) %>% 
+  add_model(lasso_spec)
+
+set.seed(123)
+WB_fold <- vfold_cv(WB, v = 10, strata = Diagnosis)
+penalty_grid <- tibble(penalty = 10^seq(-4, 0, length.out = 20))
+tune_res <- tune_grid(
+  lasso_workflow,
+  resamples = WB_fold, 
+  grid = penalty_grid
+)
+
+best_penalty <- select_best(tune_res, metric = "roc_auc")
+
+lasso_final <- finalize_workflow(lasso_workflow, best_penalty)|>
+  fit(data = WB)
+
+tidy(lasso_final) %>% 
+  filter(estimate != 0)
+
+
+#### NS Model
+rm(list = ls())
+NS <- read.csv("D:/PD/difbrain_after_corr_sn.csv")
+NS  <- NS [, -c(1:4)] 
+NS[,1] <- factor(NS[,1], levels = c(0, 1), labels = c("Class0", "Class1"))
+names(NS)[1] <- "Diagnosis"
+
+lasso_recipe <- 
+  recipe(Diagnosis ~ ., data = NS) %>% 
+  step_novel(all_nominal_predictors()) %>% 
+  step_dummy(all_nominal_predictors()) %>% 
+  step_zv(all_predictors()) %>% 
+  step_normalize(all_predictors())
+
+lasso_spec <- 
+  logistic_reg(penalty = tune(), mixture = 1) %>% 
+  set_engine("glmnet") 
+
+lasso_workflow <- workflow() %>% 
+  add_recipe(lasso_recipe) %>% 
+  add_model(lasso_spec)
+
+set.seed(123)
+NS_fold <- vfold_cv(NS, v = 10, strata = Diagnosis)
+penalty_grid <- tibble(penalty = 10^seq(-4, 0, length.out = 20))
+tune_res <- tune_grid(
+  lasso_workflow,
+  resamples = NS_fold, 
+  grid = penalty_grid
+)
+
+best_penalty <- select_best(tune_res, metric = "roc_auc")
+
+lasso_final <- finalize_workflow(lasso_workflow, best_penalty)|>
+  fit(data = NS)
+
+tidy(lasso_final) %>% 
+  filter(estimate != 0)
+
+
+#### ONS Model
+rm(list = ls())
+ONS <- read.csv("D:/PD/difbrain_after_corr_ons.csv")
+ONS  <- ONS [, -c(1:4)] 
+ONS[,1] <- factor(ONS[,1], levels = c(0, 1), labels = c("Class0", "Class1"))
+names(ONS)[1] <- "Diagnosis"
+
+lasso_recipe <- 
+  recipe(Diagnosis ~ ., data = ONS) %>% 
+  step_novel(all_nominal_predictors()) %>% 
+  step_dummy(all_nominal_predictors()) %>% 
+  step_zv(all_predictors()) %>% 
+  step_normalize(all_predictors())
+
+lasso_spec <- 
+  logistic_reg(penalty = tune(), mixture = 1) %>% 
+  set_engine("glmnet") 
+
+lasso_workflow <- workflow() %>% 
+  add_recipe(lasso_recipe) %>% 
+  add_model(lasso_spec)
+
+set.seed(123)
+ONS_fold <- vfold_cv(ONS, v = 10, strata = Diagnosis)
+penalty_grid <- tibble(penalty = 10^seq(-4, 0, length.out = 20))
+tune_res <- tune_grid(
+  lasso_workflow,
+  resamples = ONS_fold, 
+  grid = penalty_grid
+)
+
+best_penalty <- select_best(tune_res, metric = "roc_auc")
+
+lasso_final <- finalize_workflow(lasso_workflow, best_penalty)|>
+  fit(data = ONS)
+
+tidy(lasso_final) %>% 
+  filter(estimate != 0)
