@@ -280,8 +280,8 @@ test_roc_data <- list(
 custom_theme <- theme(
   panel.background = element_blank(),
   panel.border = element_rect(fill = NA, color = "black"),
-  legend.position = c(0.95, 0.05),  # 右下角坐标
-  legend.justification = c(1, 0),    # 对齐基准点
+  legend.position = c(0.95, 0.05),  
+  legend.justification = c(1, 0),    
   legend.background = element_rect(fill = "white", color = "black"),
   legend.title = element_blank(),
   legend.text = element_text(size = 11, face = "bold"),  
